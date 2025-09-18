@@ -1,25 +1,11 @@
 """
-Streamlit app: Transcript Sentiment Scorer (Single-file) — CPU-optimized + ONNX export + Checkpointing
+Streamlit app: Transcript Sentiment Scorer (Single-file)
 
-This is a single Python file that:
-- Lets you upload large CSV/Parquet transcript files (expects column 'transcript')
-- Processes transcripts in chunks and batches, using multiprocessing across CPU cores
-- If an ONNX quantized model is available it uses ONNX Runtime for faster inference
-- If ONNX model is not present, you can click a button inside the app to export & quantize DistilBERT to ONNX (this will install small helper packages and run export)
-- Checkpointing per partition so long runs can be resumed
-- Produces a single Parquet download at the end
-
-Notes:
-- Exporting & quantizing ONNX can take several minutes and requires downloading model weights from Hugging Face.
-- You can skip ONNX export and let the app use Hugging Face pipeline (slower on CPU but works).
-
-Requirements (if you plan to use ONNX export flow inside the app):
-- streamlit, pandas, pyarrow, transformers, torch, onnx, onnxruntime, optimum
-
-Quick run (recommended to install packages first):
-    pip install streamlit pandas pyarrow transformers torch onnx onnxruntime optimum
-    streamlit run streamlit_app_singlefile.py
-
+Updates in this version:
+- Token-aware chunking using the tokenizer so no input exceeds model max tokens (512)
+- Tokenizer is cached per-process to avoid repeated downloads
+- HF scoring explicitly truncates via tokenizer as extra safety
+- All other features retained: ONNX export & quantize button, ONNX runtime inference, multiprocessing, checkpointing, single-file app
 """
 
 import streamlit as st
@@ -39,16 +25,50 @@ _ONNX_RAW_PATH = os.path.join(_ONNX_DIR, "model.onnx")
 _process_state = {
     'onnx_available': None,
     'onnx_session': None,
-    'tokenizer': None,
+    'tokenizer': None,   # HF tokenizer cached per process
     'hf_pipeline': None
 }
 
 # ------------------------- Helper utilities -------------------------
 
-def chunk_text(text, max_words=300):
-    words = str(text).split()
-    for i in range(0, len(words), max_words):
-        yield " ".join(words[i:i+max_words])
+def chunk_text_by_tokens(text, tokenizer_name="distilbert-base-uncased", max_model_tokens=512, safe_margin=32):
+    """
+    Token-aware chunker that uses tokenizer to ensure returned chunks do not exceed
+    (max_model_tokens - safe_margin) token length. Caches tokenizer in _process_state for reuse.
+    Returns a list of text chunks.
+    """
+    if not isinstance(text, str) or text.strip() == "":
+        return []
+
+    # lazy-init tokenizer per process
+    if _process_state.get('tokenizer') is None:
+        try:
+            from transformers import AutoTokenizer
+            _process_state['tokenizer'] = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
+        except Exception:
+            # fallback to simple split if tokenizer can't be loaded
+            words = text.split()
+            max_words = 150
+            return [" ".join(words[i:i+max_words]) for i in range(0, len(words), max_words)]
+
+    tokenizer = _process_state['tokenizer']
+    max_chunk_tokens = max_model_tokens - safe_margin
+
+    # tokenize entire text to ids (no special tokens)
+    token_ids = tokenizer.encode(text, add_special_tokens=False)
+    if len(token_ids) <= max_chunk_tokens:
+        return [text]
+
+    chunks = []
+    start = 0
+    total = len(token_ids)
+    while start < total:
+        end = min(start + max_chunk_tokens, total)
+        # decode token slice back to text for scoring (clean spaces)
+        chunk = tokenizer.decode(token_ids[start:end], skip_special_tokens=True, clean_up_tokenization_spaces=True)
+        chunks.append(chunk)
+        start = end
+    return chunks
 
 # ------------------------- ONNX export & quantize helper (runs when user requests) -------------------------
 
@@ -83,7 +103,6 @@ def export_and_quantize_onnx(model_name="distilbert-base-uncased-finetuned-sst-2
 
     # Export using optimum export helper
     try:
-        # export will create ONNX files in out_dir (may be named model.onnx or similar)
         export(model=model_name, output=out_dir, device="cpu", opset=13, optimize=True, task="text-classification")
     except Exception as e:
         raise RuntimeError(f"ONNX export failed: {e}")
@@ -93,7 +112,6 @@ def export_and_quantize_onnx(model_name="distilbert-base-uncased-finetuned-sst-2
     if len(onnx_files) == 0:
         raise RuntimeError("No ONNX model file found after export")
 
-    # pick the largest / first ONNX file
     onnx_src = sorted(onnx_files, key=os.path.getsize, reverse=True)[0]
     onnx_dest = os.path.join(out_dir, "model.onnx")
     shutil.copyfile(onnx_src, onnx_dest)
@@ -101,6 +119,7 @@ def export_and_quantize_onnx(model_name="distilbert-base-uncased-finetuned-sst-2
     # Quantize dynamically to INT8
     quantized_path = os.path.join(out_dir, "model_quant.onnx")
     try:
+        from onnxruntime.quantization import quantize_dynamic, QuantType
         quantize_dynamic(onnx_dest, quantized_path, weight_type=QuantType.QInt8)
     except Exception as e:
         # attempt a fallback quantize with different API
@@ -138,7 +157,7 @@ def _init_onnx():
 
     try:
         sess = ort.InferenceSession(_ONNX_QUANT_PATH, providers=["CPUExecutionProvider"]) 
-        tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
+        tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased", use_fast=True)
         _process_state['onnx_session'] = sess
         _process_state['tokenizer'] = tokenizer
         _process_state['onnx_available'] = True
@@ -151,12 +170,15 @@ def _init_onnx():
 def _init_hf_pipeline(batch_size=32):
     """Initialize HF pipeline for current worker process as fallback."""
     try:
-        from transformers import pipeline
+        from transformers import pipeline, AutoTokenizer
     except Exception:
         _process_state['hf_pipeline'] = None
         return False
     try:
         _process_state['hf_pipeline'] = pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english", batch_size=batch_size)
+        # also ensure tokenizer present for safe truncation
+        if _process_state.get('tokenizer') is None:
+            _process_state['tokenizer'] = AutoTokenizer.from_pretrained("distilbert-base-uncased", use_fast=True)
         return True
     except Exception:
         _process_state['hf_pipeline'] = None
@@ -177,7 +199,6 @@ def score_texts_onnx(texts, max_length=512):
         if name in enc:
             ort_inputs[name] = enc[name]
     if len(ort_inputs) == 0:
-        # fallback to keys
         ort_inputs = {k: enc[k] for k in enc}
 
     ort_outs = sess.run(None, ort_inputs)
@@ -189,13 +210,30 @@ def score_texts_onnx(texts, max_length=512):
     return signed
 
 
-def score_texts_hf(texts, batch_size=32):
+def score_texts_hf(texts, batch_size=32, max_length=512):
+    # ensure pipeline + tokenizer
     if _process_state.get('hf_pipeline') is None:
         _init_hf_pipeline(batch_size=batch_size)
     pipe = _process_state.get('hf_pipeline')
+    tokenizer = _process_state.get('tokenizer')
     if pipe is None:
         raise RuntimeError("HF pipeline not available in worker")
-    results = pipe(texts)
+
+    # Pre-truncate texts using tokenizer to guarantee token length limits
+    safe_texts = []
+    for t in texts:
+        try:
+            token_ids = tokenizer.encode(t, add_special_tokens=False)
+            if len(token_ids) > max_length:
+                token_ids = token_ids[:max_length]
+                t_trunc = tokenizer.decode(token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
+                safe_texts.append(t_trunc)
+            else:
+                safe_texts.append(t)
+        except Exception:
+            safe_texts.append(t if isinstance(t, str) else "")
+
+    results = pipe(safe_texts)
     signed = [ (1 if r['label'] == 'POSITIVE' else -1) * r['score'] for r in results ]
     return signed
 
@@ -217,13 +255,14 @@ def process_dataframe_partition(df_partition, model_name, batch_size, chunk_word
             row_scores.append(0.0)
             continue
 
-        chunks = list(chunk_text(text, max_words=chunk_words))
+        # Token-aware chunking to ensure model max tokens not exceeded
+        chunks = chunk_text_by_tokens(text, tokenizer_name="distilbert-base-uncased", max_model_tokens=512, safe_margin=32)
         if len(chunks) == 0:
             row_scores.append(0.0)
             continue
 
         chunk_scores = []
-        step = batch_size * 8
+        step = max(1, batch_size * 8)
         for i in range(0, len(chunks), step):
             sub = chunks[i:i+step]
             try:
@@ -339,7 +378,6 @@ if uploaded is not None and start_btn:
         st.error("Unsupported file type. Please upload CSV or Parquet.")
         st.stop()
 
-    # Validate
     for p in partitions:
         if 'transcript' not in p.columns:
             st.error("Each partition must contain a column named 'transcript'. Please check your file.")
@@ -405,5 +443,3 @@ if uploaded is not None and start_btn:
         st.download_button(label="Download Result (Parquet)", data=f, file_name="transcripts_with_sentiment.parquet")
 
     st.info("Tip: For repeated runs, export & quantize ONNX once, then reuse the ONNX file to get much faster CPU inference.")
-
-# EOF
