@@ -1,0 +1,17 @@
+# Core app
+streamlit>=1.33
+pandas>=2.0
+numpy>=1.24
+pyarrow>=12.0
+
+# Hugging Face model + pipeline
+transformers>=4.40
+torch>=2.0
+
+# ONNX + optimization (for faster CPU inference)
+onnx>=1.15
+onnxruntime>=1.17
+optimum[export]>=1.19
+
+# Optional (for some quantization tooling)
+onnxruntime-tools>=1.7
